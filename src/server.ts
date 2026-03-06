@@ -2,7 +2,26 @@ import express from "express";
 import puppeteer, { Browser } from "puppeteer-core";
 
 const app = express();
-app.use(express.json());
+// 使用 text middleware 解析所有 POST body，然后转换为对象 (支持 INI 格式)
+app.use(express.text({ type: '*/*' }));
+app.use(express.json()); // 保留 JSON 兼容
+app.use((req, res, next) => {
+  if (typeof req.body === 'string') {
+    const parsed: Record<string, string> = {};
+    const lines = req.body.split(/\r?\n/);
+    for (const line of lines) {
+      const match = line.match(/^([^=]+)=(.*)$/);
+      if (match) {
+        parsed[match[1].trim()] = match[2];
+      }
+    }
+    // 如果解析出有效键值对，则覆盖 req.body
+    if (Object.keys(parsed).length > 0) {
+      req.body = parsed;
+    }
+  }
+  next();
+});
 
 const BROWSER_ENDPOINT = "http://localhost:9222";
 let browser: Browser | null = null;
@@ -17,7 +36,7 @@ async function getBrowser() {
   return browser;
 }
 
-// 核心逻辑：渐进式披露 AXTree (采用“单子节点穿透”策略)
+// 核心逻辑：渐进式披露 AXTree (采用“透明容器透传”策略)
 function formatAXTree(nodes: any[], targetNodeId?: string) {
   const nodeMap = new Map(nodes.map(n => [n.nodeId, n]));
   const root = nodes.find(n => n.role.value === "RootWebArea");
@@ -26,31 +45,38 @@ function formatAXTree(nodes: any[], targetNodeId?: string) {
   const output: string[] = [];
 
   const printNode = (nodeId: string, depth: number) => {
-    let node = nodeMap.get(nodeId);
+    const node = nodeMap.get(nodeId);
     if (!node) return;
-
-    // 1. 自动穿透逻辑：如果当前节点只有一个子节点，且不是用户指定的目标 ID，则继续向下挖掘
-    while ((node.childIds || []).length === 1 && node.nodeId !== targetNodeId) {
-      const nextNode = nodeMap.get(node.childIds![0]);
-      if (!nextNode) break;
-      node = nextNode;
-    }
 
     const role = node.role?.value || "unknown";
     const name = node.name?.value || "";
     const childIds = node.childIds || [];
 
-    // 2. 过滤掉极细微的文本行信息，保持树的骨干
+    // 1. 过滤掉极细微的文本行信息
     if (role === "InlineTextBox" || role === "LineBreak") return;
 
+    // 2. 穿透逻辑：如果是无名 generic 容器，且不是 Root 也不属于目标节点
+    // 则透传处理其子节点，不增加深度，不打印当前行
+    const isGeneric = role === "generic" || role === "none";
+    const isRoot = role === "RootWebArea";
+    const isTarget = node.nodeId === targetNodeId;
+
+    if (!isRoot && !isTarget && isGeneric && !name) {
+      for (const cid of childIds) {
+        printNode(cid, depth);
+      }
+      return;
+    }
+
+    // 3. 打印当前有意义的节点
     const indent = "  ".repeat(depth);
     const hasChildren = childIds.length > 0;
     const childPrefix = hasChildren ? "[+]" : "   ";
-    
     output.push(`${indent}${childPrefix} ID: ${node.nodeId} | [${role}] ${name}`);
 
-    // 3. 展开逻辑：如果是初始视图 (depth 0) 或者是用户指定的展开目标
-    if (depth === 0 || node.nodeId === targetNodeId) {
+    // 4. 展开逻辑：如果是初始视图 (depth 0) 或者是用户指定的展开目标
+    // 特殊处理：如果根节点下面只有一个子节点被打印，则自动展开下一层
+    if (depth === 0 || isTarget) {
       for (const cid of childIds) {
         printNode(cid, depth + 1);
       }
@@ -82,6 +108,24 @@ function resolvePage(pages: any[], query: string) {
   return matches[0].page;
 }
 
+// 辅助函数：解析 nodeId（支持数字 ID 和 角色/名称 语义搜索）
+function resolveNodeId(nodes: any[], query: string) {
+  if (/^-?\d+$/.test(query)) return query; // 支持负数 ID
+
+  const matches = nodes.filter(n => 
+    (n.role?.value === query) || (n.name?.value === query)
+  );
+
+  if (matches.length === 0) {
+    throw new Error(`Node not found for semantic query: '${query}'`);
+  }
+  if (matches.length > 1) {
+    const list = matches.map(n => `ID: ${n.nodeId} | [${n.role?.value}] ${n.name?.value || ""}`).join("\n");
+    throw new Error(`Ambiguous node query: '${query}' matches multiple elements:\n${list}\nPlease use a precise numeric ID.`);
+  }
+  return matches[0].nodeId;
+}
+
 // --- API Endpoints ---
 
 // 1. Help Docs
@@ -89,13 +133,13 @@ app.get("/", (req, res) => {
   res.send(`
 Browser Progressive MCP Proxy API
 ---------------------------------
-GET  /                   - Show this help
-GET  /tab                - List all tabs
-POST /tab                - Open new tab. Body: { "url": "https://..." }
-GET  /tab/:tabId         - List root elements. tabId can be index (0) or URL search (doubao)
-GET  /tab/:tabId/:nodeId - List child elements of a specific node
-GET  /screenshot/:tabId  - Capture screenshot as PNG
-POST /tab/:tabId/:nodeId - Interact with a node. Body: { "action": "click"|"type", "value"?: "..." }
+GET  /                        - Show this help
+GET  /tab                     - List all tabs
+POST /tab                     - Open new tab. Body: url=https://...
+GET  /tab/:tabId              - List root elements. tabId: index or URL search
+GET  /tab/:tabId/node/:nodeId - List child elements. nodeId: numeric ID or semantic query
+GET  /screenshot/:tabId       - Capture screenshot as PNG
+POST /tab/:tabId/node/:nodeId - Interact. Body: action=click|type\\nvalue=...
   `.trim());
 });
 
@@ -133,12 +177,12 @@ app.get("/tab/:tabId", async (req, res) => {
     const client = await page.target().createCDPSession();
     await client.send("Accessibility.enable");
     const { nodes } = await client.send("Accessibility.getFullAXTree");
-    res.send(formatAXTree(nodes)); // targetNodeId is undefined here
+    res.send(formatAXTree(nodes));
   } catch (e: any) { res.status(500).send(e.message); }
 });
 
 // 5. List Elements (Specific Node)
-app.get("/tab/:tabId/:nodeId", async (req, res) => {
+app.get("/tab/:tabId/node/:nodeId", async (req, res) => {
   try {
     const { tabId, nodeId } = req.params;
     const b = await getBrowser();
@@ -150,7 +194,11 @@ app.get("/tab/:tabId/:nodeId", async (req, res) => {
     const client = await page.target().createCDPSession();
     await client.send("Accessibility.enable");
     const { nodes } = await client.send("Accessibility.getFullAXTree");
-    res.send(formatAXTree(nodes, nodeId));
+    
+    let targetId;
+    try { targetId = resolveNodeId(nodes, nodeId); } catch(err:any) { return res.status(400).send(err.message); }
+    
+    res.send(formatAXTree(nodes, targetId));
   } catch (e: any) { res.status(500).send(e.message); }
 });
 
@@ -171,7 +219,7 @@ app.get("/screenshot/:tabId", async (req, res) => {
 });
 
 // 7. Interact
-app.post("/tab/:tabId/:nodeId", async (req, res) => {
+app.post("/tab/:tabId/node/:nodeId", async (req, res) => {
   try {
     const { tabId, nodeId } = req.params;
     const { action, value } = req.body;
@@ -184,7 +232,11 @@ app.post("/tab/:tabId/:nodeId", async (req, res) => {
     const client = await page.target().createCDPSession();
     await client.send("Accessibility.enable");
     const { nodes } = await client.send("Accessibility.getFullAXTree");
-    const node = nodes.find(n => n.nodeId === nodeId);
+    
+    let targetId;
+    try { targetId = resolveNodeId(nodes, nodeId); } catch(err:any) { return res.status(400).send(err.message); }
+    
+    const node = nodes.find(n => n.nodeId === targetId);
     if (!node || !node.backendDOMNodeId) return res.status(404).send("Node not found");
 
     if (action === "click") {
@@ -205,13 +257,8 @@ app.post("/tab/:tabId/:nodeId", async (req, res) => {
       await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
       
       for (const char of (value || "")) {
-        if (char === "\n") {
-          await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, macCharCode: 13 });
-          await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, macCharCode: 13 });
-        } else {
-          await client.send("Input.dispatchKeyEvent", { type: "keyDown", text: char });
-          await client.send("Input.dispatchKeyEvent", { type: "keyUp" });
-        }
+        await client.send("Input.dispatchKeyEvent", { type: "keyDown", text: char });
+        await client.send("Input.dispatchKeyEvent", { type: "keyUp" });
       }
     }
     res.send(`Success: Physical ${action} on ${nodeId}`);
