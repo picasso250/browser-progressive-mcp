@@ -60,6 +60,23 @@ function formatAXTree(nodes: any[], targetNodeId?: string) {
   return output.join("\n");
 }
 
+// 辅助函数：解析 tabId（支持索引和 URL 搜索）
+function resolvePage(pages: any[], query: string) {
+  if (/^\d+$/.test(query)) {
+    const index = parseInt(query);
+    return pages[index] || null;
+  }
+  
+  const matches = pages.filter(p => p.url().toLowerCase().includes(query.toLowerCase()));
+  if (matches.length === 0) {
+    throw new Error(`Tab not found for query: ${query}`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`Ambiguous query: '${query}' matches multiple tabs:\n${matches.map(p => p.url()).join('\n')}`);
+  }
+  return matches[0];
+}
+
 // --- API Endpoints ---
 
 // 1. Help Docs
@@ -70,7 +87,7 @@ Browser Progressive MCP Proxy API
 GET  /                   - Show this help
 GET  /tab                - List all tabs
 POST /tab                - Open new tab. Body: { "url": "https://..." }
-GET  /tab/:tabId         - List root elements of a tab (Progressive Disclosure)
+GET  /tab/:tabId         - List root elements. tabId can be index (0) or URL search (doubao)
 GET  /tab/:tabId/:nodeId - List child elements of a specific node
 GET  /screenshot/:tabId  - Capture screenshot as PNG
 POST /tab/:tabId/:nodeId - Interact with a node. Body: { "action": "click"|"type", "value"?: "..." }
@@ -104,7 +121,8 @@ app.get("/tab/:tabId", async (req, res) => {
     const { tabId } = req.params;
     const b = await getBrowser();
     const pages = await b.pages();
-    const page = pages[parseInt(tabId)];
+    let page;
+    try { page = resolvePage(pages, tabId); } catch(err:any) { return res.status(400).send(err.message); }
     if (!page) return res.status(404).send("Tab not found");
 
     const client = await page.target().createCDPSession();
@@ -120,7 +138,8 @@ app.get("/tab/:tabId/:nodeId", async (req, res) => {
     const { tabId, nodeId } = req.params;
     const b = await getBrowser();
     const pages = await b.pages();
-    const page = pages[parseInt(tabId)];
+    let page;
+    try { page = resolvePage(pages, tabId); } catch(err:any) { return res.status(400).send(err.message); }
     if (!page) return res.status(404).send("Tab not found");
 
     const client = await page.target().createCDPSession();
@@ -136,7 +155,8 @@ app.get("/screenshot/:tabId", async (req, res) => {
     const { tabId } = req.params;
     const b = await getBrowser();
     const pages = await b.pages();
-    const page = pages[parseInt(tabId)];
+    let page;
+    try { page = resolvePage(pages, tabId); } catch(err:any) { return res.status(400).send(err.message); }
     if (!page) return res.status(404).send("Tab not found");
 
     const buffer = await page.screenshot({ type: "png" });
@@ -152,7 +172,8 @@ app.post("/tab/:tabId/:nodeId", async (req, res) => {
     const { action, value } = req.body;
     const b = await getBrowser();
     const pages = await b.pages();
-    const page = pages[parseInt(tabId)];
+    let page;
+    try { page = resolvePage(pages, tabId); } catch(err:any) { return res.status(400).send(err.message); }
     if (!page) return res.status(404).send("Tab not found");
 
     const client = await page.target().createCDPSession();
