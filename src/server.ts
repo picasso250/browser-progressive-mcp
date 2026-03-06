@@ -17,7 +17,7 @@ async function getBrowser() {
   return browser;
 }
 
-// 核心逻辑：渐进式披露 AXTree
+// 核心逻辑：渐进式披露 AXTree (采用“单子节点穿透”策略)
 function formatAXTree(nodes: any[], targetNodeId?: string) {
   const nodeMap = new Map(nodes.map(n => [n.nodeId, n]));
   const root = nodes.find(n => n.role.value === "RootWebArea");
@@ -26,33 +26,34 @@ function formatAXTree(nodes: any[], targetNodeId?: string) {
   const output: string[] = [];
 
   const printNode = (nodeId: string, depth: number) => {
-    const node = nodeMap.get(nodeId);
+    let node = nodeMap.get(nodeId);
     if (!node) return;
+
+    // 1. 自动穿透逻辑：如果当前节点只有一个子节点，且不是用户指定的目标 ID，则继续向下挖掘
+    while ((node.childIds || []).length === 1 && node.nodeId !== targetNodeId) {
+      const nextNode = nodeMap.get(node.childIds![0]);
+      if (!nextNode) break;
+      node = nextNode;
+    }
 
     const role = node.role?.value || "unknown";
     const name = node.name?.value || "";
-    const hasChildren = (node.childIds || []).length > 0;
+    const childIds = node.childIds || [];
 
-    const isInteractive = ["button", "link", "textbox", "checkbox", "combobox", "listbox", "menuitem", "tab"].includes(role);
-    const isHeading = role === "heading";
-    const isImportantContainer = ["navigation", "main", "complementary", "banner"].includes(role);
+    // 2. 过滤掉极细微的文本行信息，保持树的骨干
+    if (role === "InlineTextBox" || role === "LineBreak") return;
 
-    if (nodeId === root.nodeId || isInteractive || isHeading || isImportantContainer || (name && name.length > 1)) {
-        const indent = "  ".repeat(depth);
-        const childPrefix = hasChildren ? "[+]" : "   ";
-        output.push(`${indent}${childPrefix} ID: ${nodeId} | [${role}] ${name}`);
-        
-        const maxDepth = targetNodeId ? depth + 1 : 1; // 仅多展示一层，由 AI 按需展开
-        if (depth < maxDepth) {
-          for (const childId of (node.childIds || [])) {
-            printNode(childId, depth + 1);
-          }
-        }
-    } else {
-        // 递归挖掘通用容器
-        for (const childId of (node.childIds || [])) {
-          printNode(childId, depth);
-        }
+    const indent = "  ".repeat(depth);
+    const hasChildren = childIds.length > 0;
+    const childPrefix = hasChildren ? "[+]" : "   ";
+    
+    output.push(`${indent}${childPrefix} ID: ${node.nodeId} | [${role}] ${name}`);
+
+    // 3. 展开逻辑：如果是初始视图 (depth 0) 或者是用户指定的展开目标
+    if (depth === 0 || node.nodeId === targetNodeId) {
+      for (const cid of childIds) {
+        printNode(cid, depth + 1);
+      }
     }
   };
 
@@ -67,14 +68,18 @@ function resolvePage(pages: any[], query: string) {
     return pages[index] || null;
   }
   
-  const matches = pages.filter(p => p.url().toLowerCase().includes(query.toLowerCase()));
+  const matches = pages
+    .map((p, i) => ({ page: p, index: i }))
+    .filter(m => m.page.url().toLowerCase().includes(query.toLowerCase()));
+
   if (matches.length === 0) {
     throw new Error(`Tab not found for query: ${query}`);
   }
   if (matches.length > 1) {
-    throw new Error(`Ambiguous query: '${query}' matches multiple tabs:\n${matches.map(p => p.url()).join('\n')}`);
+    const list = matches.map(m => `[${m.index}] ${m.page.url()}`).join("\n");
+    throw new Error(`Ambiguous query: '${query}' matches multiple tabs:\n${list}\nPlease specify a precise numeric ID.`);
   }
-  return matches[0];
+  return matches[0].page;
 }
 
 // --- API Endpoints ---
