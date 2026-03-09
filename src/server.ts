@@ -4,24 +4,11 @@ import puppeteer, { Browser } from "puppeteer-core";
 const app = express();
 // 仅使用 text middleware 接收所有原始文本
 app.use(express.text({ type: '*/*', limit: '1mb' }));
-app.use((req, res, next) => {
-  if (typeof req.body === 'string') {
-    const parsed: Record<string, string> = {};
-    const lines = req.body.split(/\r?\n/);
-    for (const line of lines) {
-      const match = line.match(/^([^=]+)=(.*)$/);
-      if (match) {
-        parsed[match[1].trim()] = match[2];
-      }
-    }
-    // 将解析出的键值对挂载到 query_params
-    (req as any).query_params = parsed;
-  }
-  next();
-});
 
 const BROWSER_ENDPOINT = "http://localhost:9222";
 let browser: Browser | null = null;
+
+const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 
 async function getBrowser() {
   if (!browser || !browser.connected) {
@@ -109,9 +96,41 @@ function resolveNodeId(nodes: any[], query: string) {
   return matches[0].nodeId;
 }
 
+async function resolveTargetNodeCenter(tabId: string, nodeId: string) {
+  const b = await getBrowser();
+  const pages = await b.pages();
+  const page = resolvePage(pages, tabId);
+  if (!page) throw new Error("Tab not found");
+  const client = await page.target().createCDPSession();
+  await client.send("Accessibility.enable");
+  const { nodes } = await client.send("Accessibility.getFullAXTree");
+  const targetId = resolveNodeId(nodes, nodeId);
+  const node = nodes.find(n => n.nodeId === targetId);
+  if (!node || !node.backendDOMNodeId) throw new Error("Node not found");
+
+  const { model } = await client.send("DOM.getBoxModel", { backendNodeId: node.backendDOMNodeId });
+  const quad = model.content;
+  const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
+  const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+  return { x, y, client };
+}
+
 // API Endpoints
 app.get("/", (req, res) => {
-  res.send("Browser Progressive API (Raw Text Mode)");
+  const help = `
+Browser Progressive API (Raw Text Mode)
+--------------------------------------
+GET  /tab                            - List all open tabs
+POST /tab                            - Open a new tab (body: url)
+GET  /tab/:tabId                     - Get AXTree for a tab
+GET  /tab/:tabId/node/:nodeId        - Get AXTree subtree for a node
+GET  /screenshot/:tabId              - Get screenshot (PNG)
+POST /tab/:tabId/node/:nodeId/click  - Physical click on node
+POST /tab/:tabId/node/:nodeId/scroll - Physical scroll on node (body: deltaY)
+POST /tab/:tabId/node/:nodeId/type   - Physical type on node (body: text)
+POST /eval/:tabId                   - Evaluate JS in tab (body: script)
+`.trim();
+  res.send(help);
 });
 
 app.get("/tab", async (req, res) => {
@@ -124,10 +143,11 @@ app.get("/tab", async (req, res) => {
 
 app.post("/tab", async (req, res) => {
   try {
-    const url = (req as any).query_params.url || req.body.trim();
+    const url = req.body.trim();
     const b = await getBrowser();
     const page = await b.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded" });
+    await sleep(1000);
     res.send(`Opened ${url}`);
   } catch (e: any) { res.status(500).send(e.message); }
 });
@@ -173,69 +193,71 @@ app.get("/screenshot/:tabId", async (req, res) => {
   } catch (e: any) { res.status(500).send(e.message); }
 });
 
-app.post("/tab/:tabId/node/:nodeId", async (req, res) => {
+app.post("/tab/:tabId/node/:nodeId/click", async (req, res) => {
   try {
     const { tabId, nodeId } = req.params;
-    const { action, value } = (req as any).query_params;
-    const b = await getBrowser();
-    const pages = await b.pages();
-    const page = resolvePage(pages, tabId);
-    if (!page) return res.status(404).send("Tab not found");
-    const client = await page.target().createCDPSession();
-    await client.send("Accessibility.enable");
-    const { nodes } = await client.send("Accessibility.getFullAXTree");
-    const targetId = resolveNodeId(nodes, nodeId);
-    const node = nodes.find(n => n.nodeId === targetId);
-    if (!node || !node.backendDOMNodeId) return res.status(404).send("Node not found");
+    const { x, y, client } = await resolveTargetNodeCenter(tabId, nodeId);
+    await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    await sleep(1000);
+    res.send(`Success: Physical click on ${nodeId}`);
+  } catch (e: any) { res.status(500).send(e.message); }
+});
 
-    const { model } = await client.send("DOM.getBoxModel", { backendNodeId: node.backendDOMNodeId });
-    const quad = model.content;
-    const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
-    const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+app.post("/tab/:tabId/node/:nodeId/scroll", async (req, res) => {
+  try {
+    const { tabId, nodeId } = req.params;
+    const value = req.body.trim();
+    const { x, y, client } = await resolveTargetNodeCenter(tabId, nodeId);
+    await client.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: 0, deltaY: parseInt(value || "100") });
+    await sleep(1000);
+    res.send(`Success: Physical scroll on ${nodeId}`);
+  } catch (e: any) { res.status(500).send(e.message); }
+});
 
-    if (action === "click") {
-      await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-      await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-      await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-    } else if (action === "scroll") {
-      await client.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: 0, deltaY: parseInt(value || "100") });
-    } else if (action === "type") {
-      await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-      await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-      const text = value || "";
-      if (text === "{Control+A}{Backspace}") {
-        await client.send("Input.dispatchKeyEvent", { type: "keyDown", modifiers: 2, windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, key: "a", code: "KeyA" });
-        await client.send("Input.dispatchKeyEvent", { type: "keyUp", modifiers: 2, windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, key: "a", code: "KeyA" });
-        await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
-        await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
-      } else if (text === "{Backspace}") {
-        await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
-        await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
-      } else if (text === "{Enter}") {
-        await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, key: "Enter", code: "Enter" });
-        await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, key: "Enter", code: "Enter" });
-      } else if (text === "{ArrowDown}") {
-        await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40, key: "ArrowDown", code: "ArrowDown" });
-        await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40, key: "ArrowDown", code: "ArrowDown" });
-      } else if (text === "{ArrowUp}") {
-        await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 38, key: "ArrowUp", code: "ArrowUp" });
-        await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 38, key: "ArrowUp", code: "ArrowUp" });
-      } else if (text === "{Tab}") {
-        await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9, key: "Tab", code: "Tab" });
-        await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9, key: "Tab", code: "Tab" });
-      } else {
-        for (const char of text) {
-          if (char === "\b") {
-            await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
-            await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
-          } else {
-            await client.send("Input.dispatchKeyEvent", { type: "keyDown", text: char });
-            await client.send("Input.dispatchKeyEvent", { type: "keyUp" });
-          }
+app.post("/tab/:tabId/node/:nodeId/type", async (req, res) => {
+  try {
+    const { tabId, nodeId } = req.params;
+    const text = req.body.trim();
+    const { x, y, client } = await resolveTargetNodeCenter(tabId, nodeId);
+
+    await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+
+    if (text === "{Control+A}{Backspace}") {
+      await client.send("Input.dispatchKeyEvent", { type: "keyDown", modifiers: 2, windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, key: "a", code: "KeyA" });
+      await client.send("Input.dispatchKeyEvent", { type: "keyUp", modifiers: 2, windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, key: "a", code: "KeyA" });
+      await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
+      await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
+    } else if (text === "{Backspace}") {
+      await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
+      await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
+    } else if (text === "{Enter}") {
+      await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, key: "Enter", code: "Enter" });
+      await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, key: "Enter", code: "Enter" });
+    } else if (text === "{ArrowDown}") {
+      await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40, key: "ArrowDown", code: "ArrowDown" });
+      await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40, key: "ArrowDown", code: "ArrowDown" });
+    } else if (text === "{ArrowUp}") {
+      await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 38, key: "ArrowUp", code: "ArrowUp" });
+      await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 38, key: "ArrowUp", code: "ArrowUp" });
+    } else if (text === "{Tab}") {
+      await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9, key: "Tab", code: "Tab" });
+      await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9, key: "Tab", code: "Tab" });
+    } else {
+      for (const char of text) {
+        if (char === "\b") {
+          await client.send("Input.dispatchKeyEvent", { type: "keyDown", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
+          await client.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8, key: "Backspace", code: "Backspace" });
+        } else {
+          await client.send("Input.dispatchKeyEvent", { type: "keyDown", text: char });
+          await client.send("Input.dispatchKeyEvent", { type: "keyUp" });
         }
       }
     }
-    res.send(`Success: Physical ${action} on ${nodeId}`);
+    await sleep(1000);
+    res.send(`Success: Physical type on ${nodeId}`);
   } catch (e: any) { res.status(500).send(e.message); }
 });
 
@@ -249,6 +271,7 @@ app.post("/eval/:tabId", async (req, res) => {
     const page = resolvePage(pages, tabId);
     if (!page) return res.status(404).send("Tab not found");
     const result = await page.evaluate(script);
+    await sleep(1000);
     res.send(typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result));
   } catch (e: any) { res.status(500).send(e.message); }
 });
