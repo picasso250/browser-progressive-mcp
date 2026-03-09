@@ -1,3 +1,8 @@
+---
+name: Browser
+description: 让你可以操控浏览器
+---
+
 # Browser Progressive Proxy
 
 基于“渐进式披露”原则的浏览器自动化控制工具。
@@ -8,7 +13,7 @@
 & "brave.exe" --remote-debugging-port=9222 # 你需要先 curl :9222/json 来确认是否启动，如已经启动，则不用再次启动
 
 # 启动后台服务
-npx ts-node src/server.ts
+npx ts-node src/server.ts # 同样的，你也需要先看一下这个后台服务是否已经启动
 ```
 
 ### 2. API 概览 (Base: http://localhost:3000)
